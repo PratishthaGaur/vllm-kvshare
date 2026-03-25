@@ -33,11 +33,13 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
+
+from vllm_metrics_collector import VLLMMetricsCollector
 
 
 @dataclass
@@ -45,6 +47,7 @@ class TraceRequest:
     """Represents a single request from the BurstGPT trace."""
     timestamp: float  # Arrival time in seconds
     session_id: str
+    tenant_id: str
     request_tokens: int
     response_tokens: int
     model_type: str  # ChatGPT or GPT-4
@@ -63,7 +66,10 @@ class RequestMetrics:
     time_to_first_token: float
     total_latency: float
     session_id: str
+    tenant_id: str
     log_type: str
+    vllm_metrics_before: Optional[dict[str, Any]] = None
+    vllm_metrics_after: Optional[dict[str, Any]] = None
     error: Optional[str] = None
 
 
@@ -77,7 +83,14 @@ class SessionState:
 class BurstGPTTraceReader:
     """Reads and parses BurstGPT trace CSV files."""
 
-    def __init__(self, trace_path: str, scale: float = 1.0, max_duration_seconds: Optional[float] = None):
+    def __init__(
+        self,
+        trace_path: str,
+        scale: float = 1.0,
+        max_duration_seconds: Optional[float] = None,
+        tenant_assignments: Optional[dict[str, str]] = None,
+        default_tenant: str = "unassigned",
+    ):
         """
         Initialize trace reader.
 
@@ -89,6 +102,8 @@ class BurstGPTTraceReader:
         self.trace_path = Path(trace_path)
         self.scale = scale
         self.max_duration_seconds = max_duration_seconds
+        self.tenant_assignments = tenant_assignments or {}
+        self.default_tenant = default_tenant
         self.requests = []
         self._load_trace()
 
@@ -110,10 +125,16 @@ class BurstGPTTraceReader:
                 model_type = row['Model']
                 session_id = row.get('Session ID', '').strip()
                 log_type = row.get('Log Type', '').strip()
+                resolved_session_id = session_id or f"__row_{len(self.requests)}"
+                tenant_id = self.tenant_assignments.get(
+                    resolved_session_id,
+                    self.default_tenant,
+                )
 
                 request = TraceRequest(
                     timestamp=timestamp,
-                    session_id=session_id or f"__row_{len(self.requests)}",
+                    session_id=resolved_session_id,
+                    tenant_id=tenant_id,
                     request_tokens=request_tokens,
                     response_tokens=response_tokens,
                     model_type=model_type,
@@ -155,6 +176,9 @@ class BurstGPTBenchmark:
         max_duration_seconds: Optional[float] = None,
         request_rate: Optional[float] = None,
         enable_streaming: bool = False,
+        collect_vllm_metrics: bool = False,
+        tenant_config_path: Optional[str] = None,
+        default_tenant: str = "unassigned",
         timeout_seconds: int = 300,
         temperature: float = 0.0,
     ):
@@ -183,6 +207,9 @@ class BurstGPTBenchmark:
         self.max_duration_seconds = max_duration_seconds
         self.request_rate = request_rate
         self.enable_streaming = enable_streaming
+        self.collect_vllm_metrics = collect_vllm_metrics
+        self.tenant_config_path = tenant_config_path
+        self.default_tenant = default_tenant
         self.timeout_seconds = timeout_seconds
         self.temperature = temperature
 
@@ -191,20 +218,72 @@ class BurstGPTBenchmark:
         self._setup_logging()
 
         # Load trace
+        self.tenant_assignments = self._load_tenant_assignments(
+            tenant_config_path
+        )
         self.trace_reader = BurstGPTTraceReader(
             trace_path,
             scale=scale,
-            max_duration_seconds=max_duration_seconds
+            max_duration_seconds=max_duration_seconds,
+            tenant_assignments=self.tenant_assignments,
+            default_tenant=default_tenant,
         )
         self.logger.info(f"Loaded {len(self.trace_reader)} requests from trace")
         if max_duration_seconds:
             self.logger.info(f"Trace limited to {max_duration_seconds}s ({max_duration_seconds/60:.1f} minutes)")
+        if self.tenant_assignments:
+            self.logger.info(
+                "Loaded %s session-to-tenant assignments from %s",
+                len(self.tenant_assignments),
+                tenant_config_path,
+            )
 
         # Initialize metrics
         self.metrics = []
         self.errors = defaultdict(int)
         self.session_states: dict[str, SessionState] = defaultdict(SessionState)
         self.session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.vllm_metrics_collector: Optional[VLLMMetricsCollector] = None
+        if self.collect_vllm_metrics:
+            self.vllm_metrics_collector = VLLMMetricsCollector(self.base_url)
+
+    def _load_tenant_assignments(
+        self,
+        tenant_config_path: Optional[str],
+    ) -> dict[str, str]:
+        """Load a session->tenant mapping from JSON or CSV."""
+        if not tenant_config_path:
+            return {}
+
+        path = Path(tenant_config_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Tenant config file not found: {path}")
+
+        if path.suffix.lower() == ".json":
+            with open(path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Tenant JSON config must be an object mapping session_id to tenant_id")
+            return {
+                str(session_id).strip(): str(tenant_id).strip()
+                for session_id, tenant_id in data.items()
+                if str(session_id).strip() and str(tenant_id).strip()
+            }
+
+        assignments: dict[str, str] = {}
+        with open(path, "r") as f:
+            reader = csv.DictReader(f)
+            required = {"session_id", "tenant_id"}
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise ValueError(
+                    "Tenant CSV config must contain headers: session_id,tenant_id"
+                )
+            for row in reader:
+                session_id = str(row["session_id"]).strip()
+                tenant_id = str(row["tenant_id"]).strip()
+                if session_id and tenant_id:
+                    assignments[session_id] = tenant_id
+        return assignments
 
     def _setup_logging(self):
         """Setup logging to file and console."""
@@ -341,6 +420,7 @@ class BurstGPTBenchmark:
             time_to_first_token=0.0,
             total_latency=0.0,
             session_id=trace_request.session_id,
+            tenant_id=trace_request.tenant_id,
             log_type=trace_request.log_type,
         )
 
@@ -428,6 +508,8 @@ class BurstGPTBenchmark:
         self.logger.info(f"Base URL: {self.base_url}")
         self.logger.info(f"Scale: {self.scale}x")
         self.logger.info(f"Streaming: {self.enable_streaming}")
+        self.logger.info(f"Collect vLLM metrics: {self.collect_vllm_metrics}")
+        self.logger.info(f"Default tenant: {self.default_tenant}")
 
         # Load tokenizer for token counting
         try:
@@ -456,6 +538,9 @@ class BurstGPTBenchmark:
             connector=connector,
             timeout=timeout
         ) as session:
+            if self.vllm_metrics_collector:
+                await self.vllm_metrics_collector.initialize()
+
             # Check server health
             try:
                 async with session.get(f"{self.base_url}/v1/models") as resp:
@@ -497,6 +582,9 @@ class BurstGPTBenchmark:
             self.metrics = await asyncio.gather(*tasks)
             self.metrics.sort(key=lambda metric: metric.request_id)
 
+            if self.vllm_metrics_collector:
+                await self.vllm_metrics_collector.shutdown()
+
         # Post-processing
         total_time = time.perf_counter() - start_time
         self._print_summary(total_time)
@@ -522,12 +610,22 @@ class BurstGPTBenchmark:
                 trace_request,
                 session_state,
             )
+            metrics_before = None
+            if self.vllm_metrics_collector:
+                snapshot = await self.vllm_metrics_collector.fetch_metrics()
+                if snapshot is not None:
+                    metrics_before = asdict(snapshot)
             metrics = await self._send_request(
                 request_id=request_id,
                 trace_request=trace_request,
                 prompt=prompt,
                 session=session,
             )
+            if self.vllm_metrics_collector:
+                snapshot = await self.vllm_metrics_collector.fetch_metrics()
+                if snapshot is not None:
+                    metrics.vllm_metrics_after = asdict(snapshot)
+            metrics.vllm_metrics_before = metrics_before
 
             synthetic_output = self._build_synthetic_assistant_output(
                 trace_request.response_tokens
@@ -612,6 +710,19 @@ class BurstGPTBenchmark:
             self.logger.info(f"  Input tokens/sec: {total_input/total_time:.2f}")
             self.logger.info(f"  Output tokens/sec: {total_output/total_time:.2f}")
 
+        tenant_summary = self._build_per_tenant_summary()
+        if tenant_summary:
+            self.logger.info("\nPer-tenant Summary:")
+            for tenant_id, summary in sorted(tenant_summary.items()):
+                self.logger.info(
+                    "  %s: requests=%s success=%s mean_latency=%.3fs mean_ttft=%.2fms",
+                    tenant_id,
+                    summary["total_requests"],
+                    summary["successful_requests"],
+                    summary["latency_mean"],
+                    summary["ttft_mean_ms"],
+                )
+
         self.logger.info(f"\nTotal benchmark time: {total_time:.2f}s")
 
     def _save_results(self):
@@ -624,12 +735,17 @@ class BurstGPTBenchmark:
                 "base_url": self.base_url,
                 "scale": self.scale,
                 "streaming": self.enable_streaming,
+                "collect_vllm_metrics": self.collect_vllm_metrics,
+                "tenant_config_path": self.tenant_config_path,
+                "default_tenant": self.default_tenant,
                 "timestamp": datetime.now().isoformat(),
             },
             "summary": {
                 "total_requests": len(self.metrics),
                 "successful_requests": sum(1 for m in self.metrics if m.error is None),
                 "failed_requests": sum(1 for m in self.metrics if m.error is not None),
+                "per_tenant_summary": self._build_per_tenant_summary(),
+                "vllm_metrics_summary": self._build_vllm_metrics_summary(),
             },
             "metrics": [asdict(m) for m in self.metrics],
         }
@@ -649,6 +765,82 @@ class BurstGPTBenchmark:
                 for m in self.metrics:
                     writer.writerow(asdict(m))
             self.logger.info(f"Results saved to {results_csv}")
+
+    def _build_vllm_metrics_summary(self) -> dict[str, Any]:
+        """Aggregate vLLM metrics snapshots collected during the run."""
+        if not self.collect_vllm_metrics:
+            return {}
+
+        before_snapshots = [
+            m.vllm_metrics_before for m in self.metrics if m.vllm_metrics_before
+        ]
+        after_snapshots = [
+            m.vllm_metrics_after for m in self.metrics if m.vllm_metrics_after
+        ]
+        snapshots = before_snapshots + after_snapshots
+        if not snapshots:
+            return {}
+
+        def values(key: str) -> list[float]:
+            return [
+                s[key] for s in snapshots
+                if s.get(key) is not None
+            ]
+
+        summary: dict[str, Any] = {
+            "num_snapshots": len(snapshots),
+        }
+
+        metric_names = [
+            "kv_cache_usage_pct",
+            "num_requests_running",
+            "num_requests_waiting",
+            "num_requests_swapped",
+            "num_preemptions",
+            "total_tokens_generated",
+            "total_input_tokens",
+            "avg_iteration_latency_ms",
+        ]
+        for name in metric_names:
+            vals = values(name)
+            if vals:
+                summary[name] = {
+                    "min": min(vals),
+                    "max": max(vals),
+                    "mean": float(np.mean(vals)),
+                }
+
+        return summary
+
+    def _build_per_tenant_summary(self) -> dict[str, dict[str, Any]]:
+        """Aggregate core replay metrics by tenant label."""
+        grouped: dict[str, list[RequestMetrics]] = defaultdict(list)
+        for metric in self.metrics:
+            grouped[metric.tenant_id].append(metric)
+
+        summary: dict[str, dict[str, Any]] = {}
+        for tenant_id, tenant_metrics in grouped.items():
+            successful = [m for m in tenant_metrics if m.error is None]
+            latencies = [m.total_latency for m in successful]
+            ttfts = [m.time_to_first_token for m in successful]
+            summary[tenant_id] = {
+                "total_requests": len(tenant_metrics),
+                "successful_requests": len(successful),
+                "failed_requests": len(tenant_metrics) - len(successful),
+                "latency_mean": float(np.mean(latencies)) if latencies else 0.0,
+                "latency_p95": float(np.percentile(latencies, 95)) if latencies else 0.0,
+                "ttft_mean_ms": float(np.mean(ttfts) * 1000) if ttfts else 0.0,
+                "ttft_p95_ms": float(np.percentile(ttfts, 95) * 1000) if ttfts else 0.0,
+                "mean_input_tokens": (
+                    float(np.mean([m.actual_input_tokens for m in successful]))
+                    if successful else 0.0
+                ),
+                "mean_output_tokens": (
+                    float(np.mean([m.actual_output_tokens for m in successful]))
+                    if successful else 0.0
+                ),
+            }
+        return summary
 
 
 class MockTokenizer:
@@ -720,6 +912,23 @@ def main():
         help="Use streaming mode for requests",
     )
     parser.add_argument(
+        "--collect-vllm-metrics",
+        action="store_true",
+        help="Collect server-side vLLM metrics from /metrics",
+    )
+    parser.add_argument(
+        "--tenant-config",
+        type=str,
+        default=None,
+        help="Path to JSON or CSV mapping session_id to tenant_id",
+    )
+    parser.add_argument(
+        "--default-tenant",
+        type=str,
+        default="unassigned",
+        help="Tenant label for sessions not present in --tenant-config",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=300,
@@ -744,6 +953,9 @@ def main():
         max_duration_seconds=args.max_duration,
         request_rate=args.request_rate,
         enable_streaming=args.enable_streaming,
+        collect_vllm_metrics=args.collect_vllm_metrics,
+        tenant_config_path=args.tenant_config,
+        default_tenant=args.default_tenant,
         timeout_seconds=args.timeout,
         temperature=args.temperature,
     )
