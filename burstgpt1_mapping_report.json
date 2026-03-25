@@ -1,0 +1,155 @@
+{
+  "trace_path": "/Users/pratishthagaur/Downloads/kvshare/data/BurstGPT/data/BurstGPT_1.csv",
+  "total_requests": 1429737,
+  "unique_sessions": 1429737,
+  "timestamp_start": 5,
+  "timestamp_end": 5269973,
+  "span_seconds": 5269968,
+  "heuristic": {
+    "tenant_a": {
+      "log_type": "Conversation log",
+      "max_input_tokens": 512,
+      "max_output_tokens": 256
+    },
+    "tenant_b": {
+      "description": "All other requests",
+      "heavy_input_tokens": 1024,
+      "heavy_output_tokens": 512
+    }
+  },
+  "recommended_windows": [
+    {
+      "start": 2076300,
+      "end": 2077200,
+      "score": 23877.08625,
+      "tenant_a_requests": 6,
+      "tenant_b_requests": 1969,
+      "tenant_b_heavy_requests": 1967,
+      "tenant_a_tokens": 2024,
+      "tenant_b_tokens": 4928069,
+      "conversation_requests": 15,
+      "api_requests": 1960
+    },
+    {
+      "start": 2077200,
+      "end": 2078100,
+      "score": 23826.55125,
+      "tenant_a_requests": 9,
+      "tenant_b_requests": 1965,
+      "tenant_b_heavy_requests": 1961,
+      "tenant_a_tokens": 1408,
+      "tenant_b_tokens": 4924441,
+      "conversation_requests": 23,
+      "api_requests": 1951
+    },
+    {
+      "start": 2050200,
+      "end": 2051100,
+      "score": 21478.6175,
+      "tenant_a_requests": 17,
+      "tenant_b_requests": 1787,
+      "tenant_b_heavy_requests": 1772,
+      "tenant_a_tokens": 4977,
+      "tenant_b_tokens": 4385294,
+      "conversation_requests": 53,
+      "api_requests": 1751
+    },
+    {
+      "start": 2471400,
+      "end": 2472300,
+      "score": 21177.56375,
+      "tenant_a_requests": 42,
+      "tenant_b_requests": 1950,
+      "tenant_b_heavy_requests": 1768,
+      "tenant_a_tokens": 6899,
+      "tenant_b_tokens": 3999651,
+      "conversation_requests": 73,
+      "api_requests": 1919
+    },
+    {
+      "start": 2051100,
+      "end": 2052000,
+      "score": 20703.50375,
+      "tenant_a_requests": 8,
+      "tenant_b_requests": 1722,
+      "tenant_b_heavy_requests": 1708,
+      "tenant_a_tokens": 1723,
+      "tenant_b_tokens": 4241203,
+      "conversation_requests": 29,
+      "api_requests": 1701
+    },
+    {
+      "start": 1263600,
+      "end": 1264500,
+      "score": 19548.03,
+      "tenant_a_requests": 20,
+      "tenant_b_requests": 4731,
+      "tenant_b_heavy_requests": 1308,
+      "tenant_a_tokens": 3420,
+      "tenant_b_tokens": 4035224,
+      "conversation_requests": 48,
+      "api_requests": 4703
+    },
+    {
+      "start": 3940200,
+      "end": 3941100,
+      "score": 19219.55375,
+      "tenant_a_requests": 10,
+      "tenant_b_requests": 1570,
+      "tenant_b_heavy_requests": 1552,
+      "tenant_a_tokens": 1120,
+      "tenant_b_tokens": 4170843,
+      "conversation_requests": 43,
+      "api_requests": 1537
+    },
+    {
+      "start": 3939300,
+      "end": 3940200,
+      "score": 18926.2825,
+      "tenant_a_requests": 7,
+      "tenant_b_requests": 1536,
+      "tenant_b_heavy_requests": 1522,
+      "tenant_a_tokens": 47,
+      "tenant_b_tokens": 4160226,
+      "conversation_requests": 28,
+      "api_requests": 1515
+    },
+    {
+      "start": 1264500,
+      "end": 1265400,
+      "score": 17564.56625,
+      "tenant_a_requests": 22,
+      "tenant_b_requests": 3960,
+      "tenant_b_heavy_requests": 1127,
+      "tenant_a_tokens": 4206,
+      "tenant_b_tokens": 3635653,
+      "conversation_requests": 67,
+      "api_requests": 3915
+    },
+    {
+      "start": 2032200,
+      "end": 2033100,
+      "score": 17563.16375,
+      "tenant_a_requests": 4,
+      "tenant_b_requests": 1893,
+      "tenant_b_heavy_requests": 1380,
+      "tenant_a_tokens": 458,
+      "tenant_b_tokens": 3697731,
+      "conversation_requests": 16,
+      "api_requests": 1881
+    }
+  ],
+  "recommended_primary_window": {
+    "start": 2076300,
+    "end": 2077200,
+    "score": 23877.08625,
+    "tenant_a_requests": 6,
+    "tenant_b_requests": 1969,
+    "tenant_b_heavy_requests": 1967,
+    "tenant_a_tokens": 2024,
+    "tenant_b_tokens": 4928069,
+    "conversation_requests": 15,
+    "api_requests": 1960
+  },
+  "mapping_output": "/Users/pratishthagaur/Downloads/kvshare/burstgpt1_mapping.json"
+}

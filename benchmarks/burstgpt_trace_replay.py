@@ -28,6 +28,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
@@ -68,6 +69,21 @@ class RequestMetrics:
     session_id: str
     tenant_id: str
     log_type: str
+    request_start_time: float = 0.0
+    request_end_time: float = 0.0
+    estimated_prefill_kv_tokens: int = 0
+    estimated_peak_kv_tokens: int = 0
+    estimated_prefill_kv_blocks: int = 0
+    estimated_peak_kv_blocks: int = 0
+    estimated_kv_footprint_share: float = 0.0
+    cache_pressure_harmed: bool = False
+    cache_pressure_harm_reasons: list[str] = None
+    overlapping_swap_events: int = 0
+    overlapping_preemption_events: int = 0
+    overlapping_context_swap_out_events: int = 0
+    overlapping_context_swap_in_events: int = 0
+    approximate_recompute_events: int = 0
+    approximate_recompute_cost_tokens: int = 0
     vllm_metrics_before: Optional[dict[str, Any]] = None
     vllm_metrics_after: Optional[dict[str, Any]] = None
     error: Optional[str] = None
@@ -80,6 +96,13 @@ class SessionState:
     synthetic_turn_index: int = 0
 
 
+@dataclass
+class SampledVLLMMetrics:
+    """Time-series sample of global vLLM metrics."""
+    timestamp: float
+    metrics: dict[str, Any]
+
+
 class BurstGPTTraceReader:
     """Reads and parses BurstGPT trace CSV files."""
 
@@ -88,8 +111,11 @@ class BurstGPTTraceReader:
         trace_path: str,
         scale: float = 1.0,
         max_duration_seconds: Optional[float] = None,
+        start_timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
         tenant_assignments: Optional[dict[str, str]] = None,
         default_tenant: str = "unassigned",
+        include_tenants: Optional[set[str]] = None,
     ):
         """
         Initialize trace reader.
@@ -102,19 +128,32 @@ class BurstGPTTraceReader:
         self.trace_path = Path(trace_path)
         self.scale = scale
         self.max_duration_seconds = max_duration_seconds
+        self.start_timestamp = start_timestamp
+        self.end_timestamp = end_timestamp
         self.tenant_assignments = tenant_assignments or {}
         self.default_tenant = default_tenant
+        self.include_tenants = include_tenants
         self.requests = []
         self._load_trace()
 
     def _load_trace(self):
         """Load and parse the CSV trace file."""
+        first_selected_timestamp = None
         with open(self.trace_path, 'r') as f:
             reader = csv.DictReader(f)
-            previous_timestamp = 0
 
             for row in reader:
-                timestamp = float(row['Timestamp']) / self.scale
+                raw_timestamp = float(row['Timestamp'])
+
+                if self.start_timestamp is not None and raw_timestamp < self.start_timestamp:
+                    continue
+                if self.end_timestamp is not None and raw_timestamp >= self.end_timestamp:
+                    break
+
+                if first_selected_timestamp is None:
+                    first_selected_timestamp = raw_timestamp
+
+                timestamp = (raw_timestamp - first_selected_timestamp) / self.scale
 
                 # Check if we've exceeded max duration
                 if self.max_duration_seconds is not None and timestamp > self.max_duration_seconds:
@@ -130,6 +169,8 @@ class BurstGPTTraceReader:
                     resolved_session_id,
                     self.default_tenant,
                 )
+                if self.include_tenants is not None and tenant_id not in self.include_tenants:
+                    continue
 
                 request = TraceRequest(
                     timestamp=timestamp,
@@ -141,7 +182,6 @@ class BurstGPTTraceReader:
                     log_type=log_type,
                 )
                 self.requests.append(request)
-                previous_timestamp = timestamp
 
     def get_inter_arrival_times(self) -> list[float]:
         """Get inter-arrival times between consecutive requests."""
@@ -179,8 +219,14 @@ class BurstGPTBenchmark:
         collect_vllm_metrics: bool = False,
         tenant_config_path: Optional[str] = None,
         default_tenant: str = "unassigned",
+        start_timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
+        include_tenants: Optional[list[str]] = None,
         timeout_seconds: int = 300,
         temperature: float = 0.0,
+        kv_block_size: int = 16,
+        metrics_sample_interval: float = 0.25,
+        cache_pressure_kv_threshold: float = 90.0,
     ):
         """
         Initialize the benchmark.
@@ -210,8 +256,14 @@ class BurstGPTBenchmark:
         self.collect_vllm_metrics = collect_vllm_metrics
         self.tenant_config_path = tenant_config_path
         self.default_tenant = default_tenant
+        self.start_timestamp = start_timestamp
+        self.end_timestamp = end_timestamp
+        self.include_tenants = include_tenants
         self.timeout_seconds = timeout_seconds
         self.temperature = temperature
+        self.kv_block_size = kv_block_size
+        self.metrics_sample_interval = metrics_sample_interval
+        self.cache_pressure_kv_threshold = cache_pressure_kv_threshold
 
         # Initialize logging
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -225,12 +277,21 @@ class BurstGPTBenchmark:
             trace_path,
             scale=scale,
             max_duration_seconds=max_duration_seconds,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
             tenant_assignments=self.tenant_assignments,
             default_tenant=default_tenant,
+            include_tenants=set(include_tenants) if include_tenants else None,
         )
         self.logger.info(f"Loaded {len(self.trace_reader)} requests from trace")
         if max_duration_seconds:
             self.logger.info(f"Trace limited to {max_duration_seconds}s ({max_duration_seconds/60:.1f} minutes)")
+        if start_timestamp is not None or end_timestamp is not None:
+            self.logger.info(
+                "Trace timestamp slice: start=%s end=%s",
+                start_timestamp,
+                end_timestamp,
+            )
         if self.tenant_assignments:
             self.logger.info(
                 "Loaded %s session-to-tenant assignments from %s",
@@ -244,6 +305,7 @@ class BurstGPTBenchmark:
         self.session_states: dict[str, SessionState] = defaultdict(SessionState)
         self.session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.vllm_metrics_collector: Optional[VLLMMetricsCollector] = None
+        self.sampled_vllm_metrics: list[SampledVLLMMetrics] = []
         if self.collect_vllm_metrics:
             self.vllm_metrics_collector = VLLMMetricsCollector(self.base_url)
 
@@ -402,6 +464,119 @@ class BurstGPTBenchmark:
         """Build synthetic assistant history with exact token count."""
         return self._generate_exact_token_text(output_tokens)
 
+    def _estimate_kv_blocks(self, token_count: int) -> int:
+        if token_count <= 0:
+            return 0
+        return math.ceil(token_count / self.kv_block_size)
+
+    async def _sample_vllm_metrics_periodically(
+        self,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Continuously sample global vLLM metrics during the run."""
+        if not self.vllm_metrics_collector:
+            return
+
+        while not stop_event.is_set():
+            snapshot = await self.vllm_metrics_collector.fetch_metrics()
+            if snapshot is not None:
+                self.sampled_vllm_metrics.append(
+                    SampledVLLMMetrics(
+                        timestamp=snapshot.timestamp,
+                        metrics=asdict(snapshot),
+                    )
+                )
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=self.metrics_sample_interval,
+                )
+            except asyncio.TimeoutError:
+                continue
+
+    def _metric_counter_delta_during_request(
+        self,
+        request_metric: RequestMetrics,
+        counter_name: str,
+    ) -> int:
+        if request_metric.request_end_time <= request_metric.request_start_time:
+            return 0
+
+        overlapping = [
+            sample for sample in self.sampled_vllm_metrics
+            if request_metric.request_start_time <= sample.timestamp <= request_metric.request_end_time
+        ]
+        if not overlapping:
+            return 0
+
+        values = [
+            sample.metrics.get(counter_name)
+            for sample in overlapping
+            if sample.metrics.get(counter_name) is not None
+        ]
+        if not values:
+            return 0
+        return max(0, int(values[-1] - values[0]))
+
+    def _request_overlaps_high_kv_pressure(
+        self,
+        request_metric: RequestMetrics,
+    ) -> bool:
+        return any(
+            request_metric.request_start_time <= sample.timestamp <= request_metric.request_end_time
+            and (sample.metrics.get("kv_cache_usage_pct") or 0.0) >= self.cache_pressure_kv_threshold
+            for sample in self.sampled_vllm_metrics
+        )
+
+    def _estimated_active_kv_blocks_at(self, timestamp: float) -> dict[str, int]:
+        active_by_tenant: dict[str, int] = defaultdict(int)
+        for metric in self.metrics:
+            if metric.error is not None:
+                continue
+            if metric.request_start_time <= timestamp <= metric.request_end_time:
+                active_by_tenant[metric.tenant_id] += metric.estimated_peak_kv_blocks
+        return dict(active_by_tenant)
+
+    def _annotate_requests_with_cache_pressure(self) -> None:
+        if not self.sampled_vllm_metrics:
+            return
+
+        for metric in self.metrics:
+            metric.overlapping_swap_events = self._metric_counter_delta_during_request(
+                metric, "num_requests_swapped"
+            )
+            metric.overlapping_preemption_events = self._metric_counter_delta_during_request(
+                metric, "num_preemptions"
+            )
+            metric.overlapping_context_swap_out_events = self._metric_counter_delta_during_request(
+                metric, "num_context_swap_out"
+            )
+            metric.overlapping_context_swap_in_events = self._metric_counter_delta_during_request(
+                metric, "num_context_swap_in"
+            )
+            metric.approximate_recompute_events = (
+                metric.overlapping_preemption_events
+                + metric.overlapping_context_swap_in_events
+            )
+            metric.approximate_recompute_cost_tokens = (
+                metric.approximate_recompute_events * metric.actual_input_tokens
+            )
+
+            harm_reasons: list[str] = []
+            if self._request_overlaps_high_kv_pressure(metric):
+                harm_reasons.append("high_kv_cache_usage")
+            if metric.overlapping_swap_events > 0:
+                harm_reasons.append("swap_overlap")
+            if metric.overlapping_preemption_events > 0:
+                harm_reasons.append("preemption_overlap")
+            if metric.overlapping_context_swap_out_events > 0:
+                harm_reasons.append("context_swap_out_overlap")
+            if metric.overlapping_context_swap_in_events > 0:
+                harm_reasons.append("context_swap_in_overlap")
+
+            metric.cache_pressure_harm_reasons = harm_reasons
+            metric.cache_pressure_harmed = bool(harm_reasons)
+
     async def _send_request(
         self,
         request_id: int,
@@ -422,6 +597,7 @@ class BurstGPTBenchmark:
             session_id=trace_request.session_id,
             tenant_id=trace_request.tenant_id,
             log_type=trace_request.log_type,
+            cache_pressure_harm_reasons=[],
         )
 
         try:
@@ -437,6 +613,7 @@ class BurstGPTBenchmark:
                 payload["min_tokens"] = trace_request.response_tokens
 
             start_time = time.perf_counter()
+            wall_start_time = time.time()
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
 
             async with session.post(
@@ -490,6 +667,18 @@ class BurstGPTBenchmark:
 
             metrics.total_latency = time.perf_counter() - start_time
             metrics.actual_input_tokens = len(self._encode(prompt))
+            metrics.request_start_time = wall_start_time
+            metrics.request_end_time = wall_start_time + metrics.total_latency
+            metrics.estimated_prefill_kv_tokens = metrics.actual_input_tokens
+            metrics.estimated_peak_kv_tokens = (
+                metrics.actual_input_tokens + metrics.actual_output_tokens
+            )
+            metrics.estimated_prefill_kv_blocks = self._estimate_kv_blocks(
+                metrics.estimated_prefill_kv_tokens
+            )
+            metrics.estimated_peak_kv_blocks = self._estimate_kv_blocks(
+                metrics.estimated_peak_kv_tokens
+            )
 
         except asyncio.TimeoutError:
             metrics.error = f"Request timeout after {self.timeout_seconds}s"
@@ -510,6 +699,14 @@ class BurstGPTBenchmark:
         self.logger.info(f"Streaming: {self.enable_streaming}")
         self.logger.info(f"Collect vLLM metrics: {self.collect_vllm_metrics}")
         self.logger.info(f"Default tenant: {self.default_tenant}")
+        if self.include_tenants:
+            self.logger.info(f"Included tenants: {', '.join(self.include_tenants)}")
+        if self.start_timestamp is not None or self.end_timestamp is not None:
+            self.logger.info(
+                "Trace timestamp window: start=%s end=%s",
+                self.start_timestamp,
+                self.end_timestamp,
+            )
 
         # Load tokenizer for token counting
         try:
@@ -538,8 +735,13 @@ class BurstGPTBenchmark:
             connector=connector,
             timeout=timeout
         ) as session:
+            metrics_stop_event = asyncio.Event()
+            metrics_sampler_task = None
             if self.vllm_metrics_collector:
                 await self.vllm_metrics_collector.initialize()
+                metrics_sampler_task = asyncio.create_task(
+                    self._sample_vllm_metrics_periodically(metrics_stop_event)
+                )
 
             # Check server health
             try:
@@ -583,12 +785,39 @@ class BurstGPTBenchmark:
             self.metrics.sort(key=lambda metric: metric.request_id)
 
             if self.vllm_metrics_collector:
+                metrics_stop_event.set()
+                if metrics_sampler_task:
+                    await metrics_sampler_task
+                final_snapshot = await self.vllm_metrics_collector.fetch_metrics()
+                if final_snapshot is not None:
+                    self.sampled_vllm_metrics.append(
+                        SampledVLLMMetrics(
+                            timestamp=final_snapshot.timestamp,
+                            metrics=asdict(final_snapshot),
+                        )
+                    )
                 await self.vllm_metrics_collector.shutdown()
 
         # Post-processing
+        self._annotate_requests_with_cache_pressure()
+        self._populate_estimated_kv_shares()
         total_time = time.perf_counter() - start_time
         self._print_summary(total_time)
         self._save_results()
+
+    def _populate_estimated_kv_shares(self) -> None:
+        total_peak_blocks = sum(
+            metric.estimated_peak_kv_blocks
+            for metric in self.metrics
+            if metric.error is None
+        )
+        if total_peak_blocks <= 0:
+            return
+        for metric in self.metrics:
+            if metric.error is None:
+                metric.estimated_kv_footprint_share = (
+                    metric.estimated_peak_kv_blocks / total_peak_blocks
+                )
 
     async def _run_scheduled_request(
         self,
@@ -684,6 +913,11 @@ class BurstGPTBenchmark:
         if successful_metrics:
             latencies = [m.total_latency for m in successful_metrics]
             ttft_times = [m.time_to_first_token for m in successful_metrics]
+            tbt_times = [
+                (m.total_latency - m.time_to_first_token) / max(m.actual_output_tokens, 1)
+                for m in successful_metrics
+                if m.total_latency >= m.time_to_first_token
+            ]
 
             self.logger.info("\nLatency Statistics (successful requests only):")
             self.logger.info(f"  Total latency:")
@@ -696,6 +930,11 @@ class BurstGPTBenchmark:
             self.logger.info(f"    Mean: {np.mean(ttft_times)*1000:.2f}ms")
             self.logger.info(f"    Median: {np.median(ttft_times)*1000:.2f}ms")
             self.logger.info(f"    P99: {np.percentile(ttft_times, 99)*1000:.2f}ms")
+            if tbt_times:
+                self.logger.info(f"  Time between tokens:")
+                self.logger.info(f"    Mean: {np.mean(tbt_times)*1000:.2f}ms/token")
+                self.logger.info(f"    Median: {np.median(tbt_times)*1000:.2f}ms/token")
+                self.logger.info(f"    P99: {np.percentile(tbt_times, 99)*1000:.2f}ms/token")
 
             self.logger.info(f"\nThroughput:")
             self.logger.info(f"  Requests/sec: {successful/total_time:.2f}")
@@ -715,12 +954,14 @@ class BurstGPTBenchmark:
             self.logger.info("\nPer-tenant Summary:")
             for tenant_id, summary in sorted(tenant_summary.items()):
                 self.logger.info(
-                    "  %s: requests=%s success=%s mean_latency=%.3fs mean_ttft=%.2fms",
+                    "  %s: requests=%s success=%s mean_latency=%.3fs mean_ttft=%.2fms peak_est_kv_blocks=%s harmed_frac=%.3f",
                     tenant_id,
                     summary["total_requests"],
                     summary["successful_requests"],
                     summary["latency_mean"],
                     summary["ttft_mean_ms"],
+                    summary["peak_estimated_active_kv_blocks"],
+                    summary["cache_pressure_harmed_fraction"],
                 )
 
         self.logger.info(f"\nTotal benchmark time: {total_time:.2f}s")
@@ -738,6 +979,12 @@ class BurstGPTBenchmark:
                 "collect_vllm_metrics": self.collect_vllm_metrics,
                 "tenant_config_path": self.tenant_config_path,
                 "default_tenant": self.default_tenant,
+                "include_tenants": self.include_tenants,
+                "start_timestamp": self.start_timestamp,
+                "end_timestamp": self.end_timestamp,
+                "kv_block_size": self.kv_block_size,
+                "metrics_sample_interval": self.metrics_sample_interval,
+                "cache_pressure_kv_threshold": self.cache_pressure_kv_threshold,
                 "timestamp": datetime.now().isoformat(),
             },
             "summary": {
@@ -745,9 +992,18 @@ class BurstGPTBenchmark:
                 "successful_requests": sum(1 for m in self.metrics if m.error is None),
                 "failed_requests": sum(1 for m in self.metrics if m.error is not None),
                 "per_tenant_summary": self._build_per_tenant_summary(),
+                "tbt_summary_ms_per_token": self._build_tbt_summary(),
                 "vllm_metrics_summary": self._build_vllm_metrics_summary(),
+                "cache_pressure_summary": self._build_cache_pressure_summary(),
+                "active_kv_footprint_summary": self._build_active_kv_footprint_summary(),
+                "metric_notes": {
+                    "estimated_kv_fields": "Client-side estimates from prompt/output token counts and configured kv block size.",
+                    "cache_pressure_harmed": "Overlap-based flag using sampled global vLLM metrics, not exact per-request server attribution.",
+                    "recompute_fields": "Approximate overlap-based proxies from global preemption/context-swap counters.",
+                },
             },
             "metrics": [asdict(m) for m in self.metrics],
+            "vllm_metric_samples": [asdict(sample) for sample in self.sampled_vllm_metrics],
         }
 
         results_json = self.output_dir / "results.json"
@@ -797,6 +1053,8 @@ class BurstGPTBenchmark:
             "num_requests_waiting",
             "num_requests_swapped",
             "num_preemptions",
+            "num_context_swap_out",
+            "num_context_swap_in",
             "total_tokens_generated",
             "total_input_tokens",
             "avg_iteration_latency_ms",
@@ -812,6 +1070,82 @@ class BurstGPTBenchmark:
 
         return summary
 
+    def _build_active_kv_footprint_summary(self) -> dict[str, Any]:
+        if not self.sampled_vllm_metrics:
+            return {}
+
+        per_tenant_peak_blocks: dict[str, int] = defaultdict(int)
+        per_tenant_area_blocks_seconds: dict[str, float] = defaultdict(float)
+        global_peak_blocks = 0
+        total_area_blocks_seconds = 0.0
+
+        for idx, sample in enumerate(self.sampled_vllm_metrics):
+            active_by_tenant = self._estimated_active_kv_blocks_at(sample.timestamp)
+            total_active = sum(active_by_tenant.values())
+            global_peak_blocks = max(global_peak_blocks, total_active)
+
+            next_timestamp = (
+                self.sampled_vllm_metrics[idx + 1].timestamp
+                if idx + 1 < len(self.sampled_vllm_metrics)
+                else sample.timestamp
+            )
+            duration = max(0.0, next_timestamp - sample.timestamp)
+            total_area_blocks_seconds += total_active * duration
+
+            for tenant_id, blocks in active_by_tenant.items():
+                per_tenant_peak_blocks[tenant_id] = max(
+                    per_tenant_peak_blocks[tenant_id],
+                    blocks,
+                )
+                per_tenant_area_blocks_seconds[tenant_id] += blocks * duration
+
+        return {
+            "num_samples": len(self.sampled_vllm_metrics),
+            "global_peak_estimated_active_kv_blocks": global_peak_blocks,
+            "global_mean_estimated_active_kv_blocks": (
+                total_area_blocks_seconds
+                / max(
+                    self.sampled_vllm_metrics[-1].timestamp - self.sampled_vllm_metrics[0].timestamp,
+                    1e-9,
+                )
+            ),
+            "per_tenant_peak_estimated_active_kv_blocks": dict(per_tenant_peak_blocks),
+            "per_tenant_mean_estimated_active_kv_blocks": {
+                tenant_id: (
+                    area
+                    / max(
+                        self.sampled_vllm_metrics[-1].timestamp - self.sampled_vllm_metrics[0].timestamp,
+                        1e-9,
+                    )
+                )
+                for tenant_id, area in per_tenant_area_blocks_seconds.items()
+            },
+        }
+
+    def _build_cache_pressure_summary(self) -> dict[str, Any]:
+        successful = [m for m in self.metrics if m.error is None]
+        if not successful:
+            return {}
+
+        harmed = [m for m in successful if m.cache_pressure_harmed]
+        reasons = defaultdict(int)
+        for metric in harmed:
+            for reason in metric.cache_pressure_harm_reasons:
+                reasons[reason] += 1
+
+        return {
+            "successful_requests": len(successful),
+            "harmed_requests": len(harmed),
+            "harmed_fraction": len(harmed) / len(successful),
+            "harm_reason_counts": dict(reasons),
+            "approximate_recompute_events": int(
+                sum(m.approximate_recompute_events for m in successful)
+            ),
+            "approximate_recompute_cost_tokens": int(
+                sum(m.approximate_recompute_cost_tokens for m in successful)
+            ),
+        }
+
     def _build_per_tenant_summary(self) -> dict[str, dict[str, Any]]:
         """Aggregate core replay metrics by tenant label."""
         grouped: dict[str, list[RequestMetrics]] = defaultdict(list)
@@ -823,14 +1157,39 @@ class BurstGPTBenchmark:
             successful = [m for m in tenant_metrics if m.error is None]
             latencies = [m.total_latency for m in successful]
             ttfts = [m.time_to_first_token for m in successful]
+            tbts = [
+                (m.total_latency - m.time_to_first_token) / max(m.actual_output_tokens, 1)
+                for m in successful
+                if m.total_latency >= m.time_to_first_token
+            ]
+            total_requests = len(tenant_metrics)
+            successful_requests = len(successful)
+            harmed = [m for m in successful if m.cache_pressure_harmed]
+            request_share = total_requests / max(len(self.metrics), 1)
+            kv_share = sum(
+                m.estimated_peak_kv_blocks for m in successful
+            ) / max(
+                sum(
+                    other.estimated_peak_kv_blocks
+                    for other in self.metrics
+                    if other.error is None
+                ),
+                1,
+            )
+            active_summary = self._build_active_kv_footprint_summary()
             summary[tenant_id] = {
-                "total_requests": len(tenant_metrics),
-                "successful_requests": len(successful),
-                "failed_requests": len(tenant_metrics) - len(successful),
+                "total_requests": total_requests,
+                "successful_requests": successful_requests,
+                "failed_requests": total_requests - successful_requests,
                 "latency_mean": float(np.mean(latencies)) if latencies else 0.0,
                 "latency_p95": float(np.percentile(latencies, 95)) if latencies else 0.0,
+                "latency_p99": float(np.percentile(latencies, 99)) if latencies else 0.0,
                 "ttft_mean_ms": float(np.mean(ttfts) * 1000) if ttfts else 0.0,
                 "ttft_p95_ms": float(np.percentile(ttfts, 95) * 1000) if ttfts else 0.0,
+                "ttft_p99_ms": float(np.percentile(ttfts, 99) * 1000) if ttfts else 0.0,
+                "tbt_mean_ms_per_token": float(np.mean(tbts) * 1000) if tbts else 0.0,
+                "tbt_p95_ms_per_token": float(np.percentile(tbts, 95) * 1000) if tbts else 0.0,
+                "tbt_p99_ms_per_token": float(np.percentile(tbts, 99) * 1000) if tbts else 0.0,
                 "mean_input_tokens": (
                     float(np.mean([m.actual_input_tokens for m in successful]))
                     if successful else 0.0
@@ -839,8 +1198,58 @@ class BurstGPTBenchmark:
                     float(np.mean([m.actual_output_tokens for m in successful]))
                     if successful else 0.0
                 ),
+                "mean_estimated_prefill_kv_blocks": (
+                    float(np.mean([m.estimated_prefill_kv_blocks for m in successful]))
+                    if successful else 0.0
+                ),
+                "mean_estimated_peak_kv_blocks": (
+                    float(np.mean([m.estimated_peak_kv_blocks for m in successful]))
+                    if successful else 0.0
+                ),
+                "peak_estimated_active_kv_blocks": active_summary.get(
+                    "per_tenant_peak_estimated_active_kv_blocks", {}
+                ).get(tenant_id, 0),
+                "mean_estimated_active_kv_blocks": active_summary.get(
+                    "per_tenant_mean_estimated_active_kv_blocks", {}
+                ).get(tenant_id, 0.0),
+                "request_share": request_share,
+                "estimated_kv_share": kv_share,
+                "estimated_kv_share_to_request_share_ratio": (
+                    kv_share / request_share if request_share > 0 else 0.0
+                ),
+                "cache_pressure_harmed_fraction": (
+                    len(harmed) / successful_requests if successful_requests else 0.0
+                ),
+                "approximate_swap_overlap_events": int(
+                    sum(m.overlapping_swap_events for m in successful)
+                ),
+                "approximate_preemption_overlap_events": int(
+                    sum(m.overlapping_preemption_events for m in successful)
+                ),
+                "approximate_recompute_events": int(
+                    sum(m.approximate_recompute_events for m in successful)
+                ),
+                "approximate_recompute_cost_tokens": int(
+                    sum(m.approximate_recompute_cost_tokens for m in successful)
+                ),
             }
         return summary
+
+    def _build_tbt_summary(self) -> dict[str, float]:
+        successful = [m for m in self.metrics if m.error is None]
+        tbts = [
+            (m.total_latency - m.time_to_first_token) / max(m.actual_output_tokens, 1)
+            for m in successful
+            if m.total_latency >= m.time_to_first_token
+        ]
+        if not tbts:
+            return {}
+        return {
+            "mean": float(np.mean(tbts) * 1000),
+            "median": float(np.median(tbts) * 1000),
+            "p95": float(np.percentile(tbts, 95) * 1000),
+            "p99": float(np.percentile(tbts, 99) * 1000),
+        }
 
 
 class MockTokenizer:
@@ -929,6 +1338,24 @@ def main():
         help="Tenant label for sessions not present in --tenant-config",
     )
     parser.add_argument(
+        "--start-timestamp",
+        type=float,
+        default=None,
+        help="Absolute trace timestamp to start replay from.",
+    )
+    parser.add_argument(
+        "--end-timestamp",
+        type=float,
+        default=None,
+        help="Absolute trace timestamp to stop replay before.",
+    )
+    parser.add_argument(
+        "--include-tenants",
+        type=str,
+        default=None,
+        help="Comma-separated tenant ids to replay, e.g. tenant_a or tenant_a,tenant_b",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=300,
@@ -939,6 +1366,24 @@ def main():
         type=float,
         default=0.0,
         help="Sampling temperature",
+    )
+    parser.add_argument(
+        "--kv-block-size",
+        type=int,
+        default=16,
+        help="Approximate KV block size in tokens for estimated KV metrics.",
+    )
+    parser.add_argument(
+        "--metrics-sample-interval",
+        type=float,
+        default=0.25,
+        help="Sampling interval in seconds for polling /metrics during replay.",
+    )
+    parser.add_argument(
+        "--cache-pressure-kv-threshold",
+        type=float,
+        default=90.0,
+        help="KV cache usage percentage threshold for marking cache-pressure overlap.",
     )
 
     args = parser.parse_args()
@@ -956,8 +1401,17 @@ def main():
         collect_vllm_metrics=args.collect_vllm_metrics,
         tenant_config_path=args.tenant_config,
         default_tenant=args.default_tenant,
+        start_timestamp=args.start_timestamp,
+        end_timestamp=args.end_timestamp,
+        include_tenants=(
+            [tenant.strip() for tenant in args.include_tenants.split(",") if tenant.strip()]
+            if args.include_tenants else None
+        ),
         timeout_seconds=args.timeout,
         temperature=args.temperature,
+        kv_block_size=args.kv_block_size,
+        metrics_sample_interval=args.metrics_sample_interval,
+        cache_pressure_kv_threshold=args.cache_pressure_kv_threshold,
     )
 
     asyncio.run(benchmark.run())
