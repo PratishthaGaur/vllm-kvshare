@@ -1,0 +1,228 @@
+╔════════════════════════════════════════════════════════════════════════════════════════════╗
+║                        BurstGPT BENCHMARK DATA STRUCTURE                                   ║
+╚════════════════════════════════════════════════════════════════════════════════════════════╝
+
+INPUT
+─────
+BurstGPT CSV Trace                    vLLM Server
+    │                                     │
+    ├─ Timestamp (arrival times)        ├─ Model
+    ├─ Request tokens                   ├─ GPU config
+    ├─ Response tokens                  └─ vLLM settings
+    └─ Model type (Chat/GPT-4)
+
+
+                          ↓ BENCHMARK RUNS ↓
+
+PROCESSING
+──────────
+For each request:
+  1. Read from trace (timestamp, token counts)
+  2. Generate prompt with exact token count
+  3. Wait for inter-arrival time
+  4. Send to vLLM server
+  5. Collect response metrics
+
+
+                          ↓ DATA COLLECTION ↓
+
+PER-REQUEST METRICS (collected for each of ~1000 requests)
+────────────────────────────────────────────────────────────
+
+Request #0:
+  ├─ request_id:              0
+  ├─ timestamp:               5.23
+  ├─ request_tokens:          472  ← from trace
+  ├─ expected_output_tokens:  18   ← from trace
+  ├─ actual_input_tokens:     472  ← what we sent
+  ├─ actual_output_tokens:    18   ← what model generated
+  ├─ time_to_first_token:     0.142 ← prefill latency (CRITICAL)
+  ├─ total_latency:           0.384 ← end-to-end latency (CRITICAL)
+  └─ error:                   null  ← null if success
+
+Request #1:
+  ├─ request_id:              1
+  ├─ timestamp:               45.67
+  ├─ ...
+  └─ error:                   null
+
+... (980+ more requests)
+
+
+AGGREGATE STATISTICS (computed from successful requests)
+─────────────────────────────────────────────────────────
+
+┌─ REQUEST COUNTS ─────────────────────┐
+│  Total:      980 requests            │
+│  Successful: 960 (98.0%)             │
+│  Failed:     20  (2.0%)              │
+└──────────────────────────────────────┘
+
+┌─ LATENCY - TOTAL RESPONSE TIME ──────┐
+│  Mean:   0.486s                      │
+│  Median: 0.412s                      │
+│  P95:    0.856s  ← 95% faster        │
+│  P99:    1.234s  ← 99% faster        │
+│  Min:    0.084s                      │
+│  Max:    3.521s                      │
+└──────────────────────────────────────┘
+
+┌─ LATENCY - TIME TO FIRST TOKEN ──────┐
+│  Mean:   95.23ms  (prefill)          │
+│  Median: 87.45ms                     │
+│  P95:    234.56ms                    │
+│  P99:    456.78ms                    │
+└──────────────────────────────────────┘
+
+┌─ THROUGHPUT ─────────────────────────┐
+│  Requests/sec: 4.12                  │
+│  Input toks/sec: 2,047.88            │
+│  Output toks/sec: 415.49             │
+└──────────────────────────────────────┘
+
+┌─ TOKEN STATISTICS ───────────────────┐
+│  Total input tokens:  485,230        │
+│  Total output tokens: 98,450         │
+│  Ratio: 4.93:1                       │
+└──────────────────────────────────────┘
+
+┌─ ERRORS (if any) ────────────────────┐
+│  HTTP 503: 5 requests                │
+│  Timeout:  10 requests               │
+│  Other:    5 requests                │
+└──────────────────────────────────────┘
+
+┌─ METADATA ───────────────────────────┐
+│  Benchmark time: 243.52s             │
+│  Model: llama-2-7b-hf                │
+│  Scale: 1.0 (real-time)              │
+│  Streaming: false                    │
+│  Timestamp: 2024-03-22T10:30:15      │
+└──────────────────────────────────────┘
+
+
+                          ↓ OUTPUT FILES ↓
+
+THREE OUTPUT FILES CREATED
+──────────────────────────
+
+1. benchmark.log (Human-readable detailed log)
+   ├─ All events with timestamps
+   ├─ Configuration used
+   ├─ All statistics (printed)
+   ├─ Error breakdown
+   └─ Total benchmark time
+   
+   Example:
+   ┌─────────────────────────────────────────────────────┐
+   │ 2024-03-22 10:30:15 - Starting benchmark            │
+   │ 2024-03-22 10:30:20 - Loaded 980 requests           │
+   │ 2024-03-22 10:35:42 - Benchmark Summary:            │
+   │   Total requests: 980                               │
+   │   Success rate: 98.00%                              │
+   │   Mean latency: 0.486s                              │
+   │   P99 latency: 1.234s                               │
+   │ 2024-03-22 10:35:43 - Results saved                 │
+   └─────────────────────────────────────────────────────┘
+
+
+2. results.json (Complete data in machine-readable format)
+   
+   {
+     "benchmark_config": {
+       "trace_path": "...",
+       "model": "llama-2-7b-hf",
+       "base_url": "http://localhost:8000",
+       "scale": 1.0,
+       "streaming": false,
+       "timestamp": "2024-03-22T10:30:15.234567"
+     },
+     "summary": {
+       "total_requests": 980,
+       "successful_requests": 960,
+       "failed_requests": 20
+     },
+     "metrics": [
+       {
+         "request_id": 0,
+         "timestamp": 5.23,
+         "request_tokens": 472,
+         "expected_output_tokens": 18,
+         "actual_input_tokens": 472,
+         "actual_output_tokens": 18,
+         "time_to_first_token": 0.142,
+         "total_latency": 0.384,
+         "error": null
+       },
+       { ... 979 more requests ... }
+     ]
+   }
+   
+   ✓ Use for: Programmatic analysis, pipelines, custom processing
+
+
+3. results.csv (Spreadsheet-friendly format)
+   
+   request_id,timestamp,request_tokens,expected_output_tokens,actual_input_tokens,actual_output_tokens,time_to_first_token,total_latency,error
+   0,5.23,472,18,472,18,0.142,0.384,
+   1,45.67,1087,230,1087,230,0.156,0.521,
+   2,118.45,417,276,417,276,0.168,0.495,
+   3,185.23,1360,647,1360,647,0.184,0.712,
+   4,214.56,185,215,185,215,0.098,0.345,
+   ...
+   
+   ✓ Use for: Excel/Sheets analysis, filtering, graphing
+
+
+HOW TO ACCESS
+─────────────
+
+View summary in console:
+  $ tail -50 results/benchmark.log
+
+Python analysis:
+  >>> import json
+  >>> with open('results/results.json') as f:
+  ...     data = json.load(f)
+  >>> data['metrics'][0]
+  {...}
+
+Spreadsheet import:
+  $ open results/results.csv
+
+Comparison:
+  $ python analyze_burstgpt_results.py \
+      --compare results/baseline results/optimized
+
+
+KEY METRICS AT A GLANCE
+───────────────────────
+
+For SLA compliance:
+  → Watch P99 latency (should be < 2s)
+
+For user experience:
+  → Watch P99 time-to-first-token (should be < 500ms)
+
+For system health:
+  → Watch success rate (should be > 95%)
+
+For efficiency:
+  → Watch output tokens/sec (should be > 100)
+
+
+WORKFLOW
+────────
+
+1. Run benchmark:
+   $ python burstgpt_trace_replay.py --model llama-2-7b-hf
+
+2. Get summary:
+   $ tail -50 results/benchmark.log
+
+3. Detailed analysis:
+   $ python analyze_burstgpt_results.py --results-dir results/benchmark.log
+
+4. Compare configurations:
+   $ python analyze_burstgpt_results.py --compare results/config_a results/config_b
+
