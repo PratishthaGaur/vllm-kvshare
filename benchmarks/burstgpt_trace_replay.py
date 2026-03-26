@@ -76,6 +76,8 @@ class RequestMetrics:
     estimated_prefill_kv_blocks: int = 0
     estimated_peak_kv_blocks: int = 0
     estimated_kv_footprint_share: float = 0.0
+    num_cached_tokens: int = 0
+    cache_reuse_rate: float = 0.0
     cache_pressure_harmed: bool = False
     cache_pressure_harm_reasons: list[str] = None
     overlapping_swap_events: int = 0
@@ -611,6 +613,8 @@ class BurstGPTBenchmark:
             }
             if trace_request.response_tokens > 0:
                 payload["min_tokens"] = trace_request.response_tokens
+            if self.enable_streaming:
+                payload["stream_options"] = {"include_usage": True}
 
             start_time = time.perf_counter()
             wall_start_time = time.time()
@@ -648,6 +652,12 @@ class BurstGPTBenchmark:
 
                         try:
                             data = json.loads(payload_line)
+                            usage = data.get("usage")
+                            if usage:
+                                prompt_details = usage.get("prompt_tokens_details") or {}
+                                cached_tokens = prompt_details.get("cached_tokens")
+                                if cached_tokens is not None:
+                                    metrics.num_cached_tokens = int(cached_tokens)
                             if "choices" in data:
                                 output_text += data["choices"][0].get("text", "")
                         except (json.JSONDecodeError, IndexError, KeyError):
@@ -660,6 +670,11 @@ class BurstGPTBenchmark:
                     # Non-streaming response
                     data = await resp.json()
                     output_text = data["choices"][0]["text"]
+                    usage = data.get("usage") or {}
+                    prompt_details = usage.get("prompt_tokens_details") or {}
+                    cached_tokens = prompt_details.get("cached_tokens")
+                    if cached_tokens is not None:
+                        metrics.num_cached_tokens = int(cached_tokens)
                     metrics.actual_output_tokens = len(
                         self._encode(output_text)
                     )
@@ -678,6 +693,10 @@ class BurstGPTBenchmark:
             )
             metrics.estimated_peak_kv_blocks = self._estimate_kv_blocks(
                 metrics.estimated_peak_kv_tokens
+            )
+            metrics.cache_reuse_rate = (
+                metrics.num_cached_tokens / metrics.actual_input_tokens
+                if metrics.actual_input_tokens > 0 else 0.0
             )
 
         except asyncio.TimeoutError:
@@ -1204,6 +1223,18 @@ class BurstGPTBenchmark:
                 ),
                 "mean_estimated_peak_kv_blocks": (
                     float(np.mean([m.estimated_peak_kv_blocks for m in successful]))
+                    if successful else 0.0
+                ),
+                "mean_num_cached_tokens": (
+                    float(np.mean([m.num_cached_tokens for m in successful]))
+                    if successful else 0.0
+                ),
+                "cache_reuse_rate_mean": (
+                    float(np.mean([m.cache_reuse_rate for m in successful]))
+                    if successful else 0.0
+                ),
+                "cache_reuse_rate_p95": (
+                    float(np.percentile([m.cache_reuse_rate for m in successful], 95))
                     if successful else 0.0
                 ),
                 "peak_estimated_active_kv_blocks": active_summary.get(
