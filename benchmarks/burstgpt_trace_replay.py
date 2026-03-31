@@ -69,6 +69,7 @@ class RequestMetrics:
     session_id: str
     tenant_id: str
     log_type: str
+    session_turn_index: int = 0
     request_start_time: float = 0.0
     request_end_time: float = 0.0
     estimated_prefill_kv_tokens: int = 0
@@ -77,6 +78,11 @@ class RequestMetrics:
     estimated_peak_kv_blocks: int = 0
     estimated_kv_footprint_share: float = 0.0
     num_cached_tokens: int = 0
+    expected_cacheable_tokens: int = 0
+    cache_deficit_tokens: int = 0
+    cache_deficit_ratio: float = 0.0
+    cache_recompute_suspected: bool = False
+    cache_recompute_reason: Optional[str] = None
     cache_reuse_rate: float = 0.0
     cache_pressure_harmed: bool = False
     cache_pressure_harm_reasons: list[str] = None
@@ -229,6 +235,7 @@ class BurstGPTBenchmark:
         kv_block_size: int = 16,
         metrics_sample_interval: float = 0.25,
         cache_pressure_kv_threshold: float = 90.0,
+        recompute_cache_deficit_ratio_threshold: float = 0.3,
     ):
         """
         Initialize the benchmark.
@@ -266,6 +273,9 @@ class BurstGPTBenchmark:
         self.kv_block_size = kv_block_size
         self.metrics_sample_interval = metrics_sample_interval
         self.cache_pressure_kv_threshold = cache_pressure_kv_threshold
+        self.recompute_cache_deficit_ratio_threshold = (
+            recompute_cache_deficit_ratio_threshold
+        )
 
         # Initialize logging
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -854,6 +864,8 @@ class BurstGPTBenchmark:
         lock = self.session_locks[trace_request.session_id]
         async with lock:
             session_state = self.session_states[trace_request.session_id]
+            current_turn_index = session_state.synthetic_turn_index + 1
+            prior_transcript_tokens = len(self._encode(session_state.transcript))
             prompt = self._build_prompt_for_request(
                 trace_request,
                 session_state,
@@ -869,6 +881,29 @@ class BurstGPTBenchmark:
                 prompt=prompt,
                 session=session,
             )
+            metrics.session_turn_index = current_turn_index
+            if current_turn_index > 1 and metrics.error is None:
+                metrics.expected_cacheable_tokens = min(
+                    metrics.actual_input_tokens,
+                    prior_transcript_tokens,
+                )
+                metrics.cache_deficit_tokens = max(
+                    0,
+                    metrics.expected_cacheable_tokens - metrics.num_cached_tokens,
+                )
+                metrics.cache_deficit_ratio = (
+                    metrics.cache_deficit_tokens / metrics.expected_cacheable_tokens
+                    if metrics.expected_cacheable_tokens > 0 else 0.0
+                )
+                if (
+                    metrics.expected_cacheable_tokens > 0
+                    and metrics.cache_deficit_ratio
+                    >= self.recompute_cache_deficit_ratio_threshold
+                ):
+                    metrics.cache_recompute_suspected = True
+                    metrics.cache_recompute_reason = (
+                        "low_cached_tokens_for_later_turn"
+                    )
             if self.vllm_metrics_collector:
                 snapshot = await self.vllm_metrics_collector.fetch_metrics()
                 if snapshot is not None:
@@ -973,7 +1008,7 @@ class BurstGPTBenchmark:
             self.logger.info("\nPer-tenant Summary:")
             for tenant_id, summary in sorted(tenant_summary.items()):
                 self.logger.info(
-                    "  %s: requests=%s success=%s mean_latency=%.3fs mean_ttft=%.2fms peak_est_kv_blocks=%s harmed_frac=%.3f",
+                    "  %s: requests=%s success=%s mean_latency=%.3fs mean_ttft=%.2fms peak_est_kv_blocks=%s harmed_frac=%.3f suspected_recompute_frac=%.3f",
                     tenant_id,
                     summary["total_requests"],
                     summary["successful_requests"],
@@ -981,6 +1016,7 @@ class BurstGPTBenchmark:
                     summary["ttft_mean_ms"],
                     summary["peak_estimated_active_kv_blocks"],
                     summary["cache_pressure_harmed_fraction"],
+                    summary["suspected_recompute_from_cache_deficit_fraction"],
                 )
 
         self.logger.info(f"\nTotal benchmark time: {total_time:.2f}s")
@@ -1004,6 +1040,7 @@ class BurstGPTBenchmark:
                 "kv_block_size": self.kv_block_size,
                 "metrics_sample_interval": self.metrics_sample_interval,
                 "cache_pressure_kv_threshold": self.cache_pressure_kv_threshold,
+                "recompute_cache_deficit_ratio_threshold": self.recompute_cache_deficit_ratio_threshold,
                 "timestamp": datetime.now().isoformat(),
             },
             "summary": {
@@ -1019,6 +1056,7 @@ class BurstGPTBenchmark:
                     "estimated_kv_fields": "Client-side estimates from prompt/output token counts and configured kv block size.",
                     "cache_pressure_harmed": "Overlap-based flag using sampled global vLLM metrics, not exact per-request server attribution.",
                     "recompute_fields": "Approximate overlap-based proxies from global preemption/context-swap counters.",
+                    "cache_deficit_recompute": "For later turns only: compares expected cacheable tokens from prior session transcript against num_cached_tokens. High deficit suggests cache miss/recompute.",
                 },
             },
             "metrics": [asdict(m) for m in self.metrics],
@@ -1147,6 +1185,10 @@ class BurstGPTBenchmark:
             return {}
 
         harmed = [m for m in successful if m.cache_pressure_harmed]
+        later_turn_successful = [m for m in successful if m.session_turn_index > 1]
+        suspected_recompute = [
+            m for m in later_turn_successful if m.cache_recompute_suspected
+        ]
         reasons = defaultdict(int)
         for metric in harmed:
             for reason in metric.cache_pressure_harm_reasons:
@@ -1157,6 +1199,12 @@ class BurstGPTBenchmark:
             "harmed_requests": len(harmed),
             "harmed_fraction": len(harmed) / len(successful),
             "harm_reason_counts": dict(reasons),
+            "later_turn_successful_requests": len(later_turn_successful),
+            "suspected_recompute_from_cache_deficit_requests": len(suspected_recompute),
+            "suspected_recompute_from_cache_deficit_fraction": (
+                len(suspected_recompute) / len(later_turn_successful)
+                if later_turn_successful else 0.0
+            ),
             "approximate_recompute_events": int(
                 sum(m.approximate_recompute_events for m in successful)
             ),
@@ -1174,6 +1222,10 @@ class BurstGPTBenchmark:
         summary: dict[str, dict[str, Any]] = {}
         for tenant_id, tenant_metrics in grouped.items():
             successful = [m for m in tenant_metrics if m.error is None]
+            later_turn_successful = [m for m in successful if m.session_turn_index > 1]
+            suspected_recompute = [
+                m for m in later_turn_successful if m.cache_recompute_suspected
+            ]
             latencies = [m.total_latency for m in successful]
             ttfts = [m.time_to_first_token for m in successful]
             tbts = [
@@ -1229,6 +1281,18 @@ class BurstGPTBenchmark:
                     float(np.mean([m.num_cached_tokens for m in successful]))
                     if successful else 0.0
                 ),
+                "mean_expected_cacheable_tokens_later_turns": (
+                    float(np.mean([m.expected_cacheable_tokens for m in later_turn_successful]))
+                    if later_turn_successful else 0.0
+                ),
+                "mean_cache_deficit_tokens_later_turns": (
+                    float(np.mean([m.cache_deficit_tokens for m in later_turn_successful]))
+                    if later_turn_successful else 0.0
+                ),
+                "mean_cache_deficit_ratio_later_turns": (
+                    float(np.mean([m.cache_deficit_ratio for m in later_turn_successful]))
+                    if later_turn_successful else 0.0
+                ),
                 "cache_reuse_rate_mean": (
                     float(np.mean([m.cache_reuse_rate for m in successful]))
                     if successful else 0.0
@@ -1251,6 +1315,11 @@ class BurstGPTBenchmark:
                 "cache_pressure_harmed_fraction": (
                     len(harmed) / successful_requests if successful_requests else 0.0
                 ),
+                "suspected_recompute_from_cache_deficit_fraction": (
+                    len(suspected_recompute) / len(later_turn_successful)
+                    if later_turn_successful else 0.0
+                ),
+                "suspected_recompute_from_cache_deficit_requests": len(suspected_recompute),
                 "approximate_swap_overlap_events": int(
                     sum(m.overlapping_swap_events for m in successful)
                 ),
@@ -1416,6 +1485,16 @@ def main():
         default=90.0,
         help="KV cache usage percentage threshold for marking cache-pressure overlap.",
     )
+    parser.add_argument(
+        "--recompute-cache-deficit-ratio-threshold",
+        type=float,
+        default=0.3,
+        help=(
+            "For later turns only, flag suspected recompute when "
+            "(expected_cacheable_tokens - num_cached_tokens) / expected_cacheable_tokens "
+            "is at least this value."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1443,6 +1522,9 @@ def main():
         kv_block_size=args.kv_block_size,
         metrics_sample_interval=args.metrics_sample_interval,
         cache_pressure_kv_threshold=args.cache_pressure_kv_threshold,
+        recompute_cache_deficit_ratio_threshold=(
+            args.recompute_cache_deficit_ratio_threshold
+        ),
     )
 
     asyncio.run(benchmark.run())
